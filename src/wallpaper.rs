@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::gif_decoder::AnimatedFrames;
 use crate::{CosmicBg, CosmicBgLayer};
 
 use std::collections::VecDeque;
@@ -34,11 +35,18 @@ pub struct Wallpaper {
     // Cache of source image, if `current_source` is a `Source::Path`
     current_image: Option<image::DynamicImage>,
     timer_token: Option<RegistrationToken>,
+    /// Pre-decoded animated GIF frames (if current source is an animated GIF).
+    animated_frames: Option<AnimatedFrames>,
+    /// calloop token for the per-frame animation timer.
+    animation_token: Option<RegistrationToken>,
 }
 
 impl Drop for Wallpaper {
     fn drop(&mut self) {
         if let Some(token) = self.timer_token.take() {
+            self.loop_handle.remove(token);
+        }
+        if let Some(token) = self.animation_token.take() {
             self.loop_handle.remove(token);
         }
     }
@@ -56,13 +64,16 @@ impl Wallpaper {
             layers: Vec::new(),
             current_source: None,
             current_image: None,
+            animated_frames: None,
             image_queue: VecDeque::default(),
             timer_token: None,
+            animation_token: None,
             loop_handle,
             queue_handle,
         };
 
         wallpaper.load_images();
+        wallpaper.try_load_animated();
         wallpaper.register_timer();
         wallpaper.watch_source(source_tx);
         wallpaper
@@ -114,71 +125,90 @@ impl Wallpaper {
                 .as_ref()
                 .is_none_or(|img| img.width() != width || img.height() != height)
             {
-                let Some(source) = self.current_source.as_ref() else {
-                    tracing::info!("No source for wallpaper");
-                    continue;
-                };
+                // Animated GIF: use the current pre-decoded frame as image source.
+                if let Some(ref animated) = self.animated_frames {
+                    let img = &animated.current_frame().image;
+                    cur_resized_img = match self.entry.scaling_mode {
+                        ScalingMode::Fit(ref color) => {
+                            Some(crate::scaler::fit(img, color, width, height))
+                        }
+                        ScalingMode::Zoom => Some(crate::scaler::zoom(img, width, height)),
+                        ScalingMode::Stretch => {
+                            Some(crate::scaler::stretch(img, width, height))
+                        }
+                    };
+                } else {
+                    // Static image / color fallback (original logic).
+                    let Some(source) = self.current_source.as_ref() else {
+                        tracing::info!("No source for wallpaper");
+                        continue;
+                    };
 
-                cur_resized_img = match source {
-                    Source::Path(path) => {
-                        if self.current_image.is_none() {
-                            self.current_image = match ImageReader::open(path)
-                                .ok()
-                                .and_then(|f| f.with_guessed_format().ok())
-                            {
-                                Some(mut f) => {
-                                    let mut limits = Limits::default();
-                                    limits.max_alloc = Some(1024 * 1024 * 1024);
-                                    f.limits(limits);
+                    cur_resized_img = match source {
+                        Source::Path(path) => {
+                            if self.current_image.is_none() {
+                                self.current_image = match ImageReader::open(path)
+                                    .ok()
+                                    .and_then(|f| f.with_guessed_format().ok())
+                                {
+                                    Some(mut f) => {
+                                        let mut limits = Limits::default();
+                                        limits.max_alloc = Some(1024 * 1024 * 1024);
+                                        f.limits(limits);
 
-                                    match f.decode() {
-                                        Ok(img) => Some(img),
-                                        Err(why) => {
-                                            tracing::warn!(
-                                                ?why,
-                                                "Failed to decode image: {}",
-                                                path.display()
-                                            );
-                                            continue;
+                                        match f.decode() {
+                                            Ok(img) => Some(img),
+                                            Err(why) => {
+                                                tracing::warn!(
+                                                    ?why,
+                                                    "Failed to decode image: {}",
+                                                    path.display()
+                                                );
+                                                continue;
+                                            }
                                         }
                                     }
+                                    None => continue,
+                                };
+                            }
+                            let img = self.current_image.as_ref().unwrap();
+
+                            match self.entry.scaling_mode {
+                                ScalingMode::Fit(color) => {
+                                    Some(crate::scaler::fit(img, &color, width, height))
                                 }
-                                None => continue,
-                            };
-                        }
-                        let img = self.current_image.as_ref().unwrap();
 
-                        match self.entry.scaling_mode {
-                            ScalingMode::Fit(color) => {
-                                Some(crate::scaler::fit(img, &color, width, height))
-                            }
+                                ScalingMode::Zoom => {
+                                    Some(crate::scaler::zoom(img, width, height))
+                                }
 
-                            ScalingMode::Zoom => Some(crate::scaler::zoom(img, width, height)),
-
-                            ScalingMode::Stretch => {
-                                Some(crate::scaler::stretch(img, width, height))
+                                ScalingMode::Stretch => {
+                                    Some(crate::scaler::stretch(img, width, height))
+                                }
                             }
                         }
-                    }
 
-                    Source::Color(Color::Single([r, g, b])) => Some(image::DynamicImage::from(
-                        crate::colored::single([*r, *g, *b], width, height),
-                    )),
+                        Source::Color(Color::Single([r, g, b])) => {
+                            Some(image::DynamicImage::from(
+                                crate::colored::single([*r, *g, *b], width, height),
+                            ))
+                        }
 
-                    Source::Color(Color::Gradient(gradient)) => {
-                        match crate::colored::gradient(gradient, width, height) {
-                            Ok(buffer) => Some(image::DynamicImage::from(buffer)),
-                            Err(why) => {
-                                tracing::error!(
-                                    ?gradient,
-                                    ?why,
-                                    "color gradient in config is invalid"
-                                );
-                                None
+                        Source::Color(Color::Gradient(gradient)) => {
+                            match crate::colored::gradient(gradient, width, height) {
+                                Ok(buffer) => Some(image::DynamicImage::from(buffer)),
+                                Err(why) => {
+                                    tracing::error!(
+                                        ?gradient,
+                                        ?why,
+                                        "color gradient in config is invalid"
+                                    );
+                                    None
+                                }
                             }
                         }
-                    }
-                };
+                    };
+                }
             }
 
             let image = cur_resized_img.as_ref().unwrap();
@@ -351,6 +381,7 @@ impl Wallpaper {
 
                             item.image_queue.push_back(next);
                             item.clear_image();
+                            item.try_load_animated();
                             item.draw();
 
                             return TimeoutAction::ToDuration(Duration::from_secs(rotation_freq));
@@ -365,9 +396,93 @@ impl Wallpaper {
 
     fn clear_image(&mut self) {
         self.current_image = None;
+        self.animated_frames = None;
+        if let Some(token) = self.animation_token.take() {
+            self.loop_handle.remove(token);
+        }
         for l in &mut self.layers {
             l.needs_redraw = true;
         }
+    }
+
+    /// Auto-detect animated GIF from `current_source` and pre-decode all frames.
+    /// If the source is an animated GIF (>1 frame), populates `animated_frames`
+    /// and registers an animation timer to drive frame advancement.
+    fn try_load_animated(&mut self) {
+        let Some(Source::Path(ref path)) = self.current_source else {
+            return;
+        };
+
+        // Quick extension check before attempting a full decode.
+        let is_gif = path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("gif"))
+            .unwrap_or(false);
+
+        if !is_gif {
+            return;
+        }
+
+        match AnimatedFrames::from_path(path) {
+            Some(frames) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "animated GIF detected, starting live background"
+                );
+                self.animated_frames = Some(frames);
+                self.register_animation_timer();
+            }
+            None => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "GIF has ≤1 frame, treating as static image"
+                );
+            }
+        }
+    }
+
+    /// Register a calloop timer that advances the animated GIF frame and
+    /// triggers a redraw at each frame's native delay (capped at ~30 FPS).
+    fn register_animation_timer(&mut self) {
+        let Some(ref animated) = self.animated_frames else {
+            return;
+        };
+
+        let delay = animated.current_delay();
+        let output = self.entry.output.clone();
+
+        self.animation_token = self
+            .loop_handle
+            .insert_source(
+                Timer::from_duration(delay),
+                move |_, _, state: &mut CosmicBg| {
+                    let Some(wallpaper) = state
+                        .wallpapers
+                        .iter_mut()
+                        .find(|w| w.entry.output == output)
+                    else {
+                        return TimeoutAction::Drop;
+                    };
+
+                    // Advance frame and grab the delay *before* calling draw()
+                    // to avoid borrow conflicts.
+                    let next_delay = {
+                        let Some(ref mut animated) = wallpaper.animated_frames else {
+                            return TimeoutAction::Drop;
+                        };
+                        animated.advance();
+                        animated.current_delay()
+                    };
+
+                    for l in &mut wallpaper.layers {
+                        l.needs_redraw = true;
+                    }
+                    wallpaper.draw();
+
+                    TimeoutAction::ToDuration(next_delay)
+                },
+            )
+            .ok();
     }
 }
 

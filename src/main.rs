@@ -2,6 +2,7 @@
 
 mod colored;
 mod draw;
+mod gif_decoder;
 mod img_source;
 mod scaler;
 mod wallpaper;
