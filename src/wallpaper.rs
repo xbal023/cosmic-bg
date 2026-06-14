@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::gif_decoder::AnimatedFrames;
+use crate::video_decoder::VideoPlayer;
 use crate::{CosmicBg, CosmicBgLayer};
 
 use std::collections::VecDeque;
@@ -37,7 +38,9 @@ pub struct Wallpaper {
     timer_token: Option<RegistrationToken>,
     /// Pre-decoded animated GIF frames (if current source is an animated GIF).
     animated_frames: Option<AnimatedFrames>,
-    /// calloop token for the per-frame animation timer.
+    /// Background-thread video decoder (if current source is a video file).
+    video_player: Option<VideoPlayer>,
+    /// calloop token for the per-frame animation timer (shared by GIF & video).
     animation_token: Option<RegistrationToken>,
 }
 
@@ -65,6 +68,7 @@ impl Wallpaper {
             current_source: None,
             current_image: None,
             animated_frames: None,
+            video_player: None,
             image_queue: VecDeque::default(),
             timer_token: None,
             animation_token: None,
@@ -137,6 +141,19 @@ impl Wallpaper {
                             Some(crate::scaler::stretch(img, width, height))
                         }
                     };
+                // Video: use the latest frame from the background decoder thread.
+                } else if let Some(ref video) = self.video_player {
+                    if let Some(img) = video.current_image() {
+                        cur_resized_img = match self.entry.scaling_mode {
+                            ScalingMode::Fit(ref color) => {
+                                Some(crate::scaler::fit(img, color, width, height))
+                            }
+                            ScalingMode::Zoom => Some(crate::scaler::zoom(img, width, height)),
+                            ScalingMode::Stretch => {
+                                Some(crate::scaler::stretch(img, width, height))
+                            }
+                        };
+                    }
                 } else {
                     // Static image / color fallback (original logic).
                     let Some(source) = self.current_source.as_ref() else {
@@ -397,6 +414,7 @@ impl Wallpaper {
     fn clear_image(&mut self) {
         self.current_image = None;
         self.animated_frames = None;
+        self.video_player = None; // drops thread via channel close
         if let Some(token) = self.animation_token.take() {
             self.loop_handle.remove(token);
         }
@@ -405,50 +423,74 @@ impl Wallpaper {
         }
     }
 
-    /// Auto-detect animated GIF from `current_source` and pre-decode all frames.
-    /// If the source is an animated GIF (>1 frame), populates `animated_frames`
-    /// and registers an animation timer to drive frame advancement.
+    /// Auto-detect animated source (GIF or video) from `current_source`.
+    /// If animated, populates the appropriate field and registers the
+    /// animation timer.
     fn try_load_animated(&mut self) {
         let Some(Source::Path(ref path)) = self.current_source else {
             return;
         };
 
-        // Quick extension check before attempting a full decode.
+        // 1) Try animated GIF first.
         let is_gif = path
             .extension()
             .map(|ext| ext.eq_ignore_ascii_case("gif"))
             .unwrap_or(false);
 
-        if !is_gif {
-            return;
+        if is_gif {
+            match AnimatedFrames::from_path(path) {
+                Some(frames) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "animated GIF detected, starting live background"
+                    );
+                    self.animated_frames = Some(frames);
+                    self.register_animation_timer();
+                    return;
+                }
+                None => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "GIF has ≤1 frame, treating as static image"
+                    );
+                    return;
+                }
+            }
         }
 
-        match AnimatedFrames::from_path(path) {
-            Some(frames) => {
-                tracing::info!(
-                    path = %path.display(),
-                    "animated GIF detected, starting live background"
-                );
-                self.animated_frames = Some(frames);
-                self.register_animation_timer();
-            }
-            None => {
-                tracing::debug!(
-                    path = %path.display(),
-                    "GIF has ≤1 frame, treating as static image"
-                );
+        // 2) Try video file.
+        if crate::video_decoder::is_video_file(path) {
+            match VideoPlayer::from_path(path) {
+                Some(player) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "video detected, starting live background"
+                    );
+                    self.video_player = Some(player);
+                    self.register_animation_timer();
+                }
+                None => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to open video, treating as static image"
+                    );
+                }
             }
         }
     }
 
-    /// Register a calloop timer that advances the animated GIF frame and
-    /// triggers a redraw at each frame's native delay (capped at ~30 FPS).
+    /// Register a calloop timer that drives GIF frame advancement or video
+    /// frame consumption and triggers redraws at ~30 FPS.
     fn register_animation_timer(&mut self) {
-        let Some(ref animated) = self.animated_frames else {
+        // Determine initial delay from whichever animated source is active.
+        let delay = if let Some(ref animated) = self.animated_frames {
+            animated.current_delay()
+        } else if let Some(ref video) = self.video_player {
+            video.frame_delay
+        } else {
             return;
         };
 
-        let delay = animated.current_delay();
         let output = self.entry.output.clone();
 
         self.animation_token = self
@@ -464,22 +506,39 @@ impl Wallpaper {
                         return TimeoutAction::Drop;
                     };
 
-                    // Advance frame and grab the delay *before* calling draw()
-                    // to avoid borrow conflicts.
-                    let next_delay = {
-                        let Some(ref mut animated) = wallpaper.animated_frames else {
-                            return TimeoutAction::Drop;
+                    // --- GIF path ---
+                    if wallpaper.animated_frames.is_some() {
+                        let next_delay = {
+                            let animated = wallpaper.animated_frames.as_mut().unwrap();
+                            animated.advance();
+                            animated.current_delay()
                         };
-                        animated.advance();
-                        animated.current_delay()
-                    };
 
-                    for l in &mut wallpaper.layers {
-                        l.needs_redraw = true;
+                        for l in &mut wallpaper.layers {
+                            l.needs_redraw = true;
+                        }
+                        wallpaper.draw();
+
+                        return TimeoutAction::ToDuration(next_delay);
                     }
-                    wallpaper.draw();
 
-                    TimeoutAction::ToDuration(next_delay)
+                    // --- Video path ---
+                    if wallpaper.video_player.is_some() {
+                        let delay = {
+                            let video = wallpaper.video_player.as_mut().unwrap();
+                            video.advance();
+                            video.frame_delay
+                        };
+
+                        for l in &mut wallpaper.layers {
+                            l.needs_redraw = true;
+                        }
+                        wallpaper.draw();
+
+                        return TimeoutAction::ToDuration(delay);
+                    }
+
+                    TimeoutAction::Drop
                 },
             )
             .ok();

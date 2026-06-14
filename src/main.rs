@@ -5,6 +5,7 @@ mod draw;
 mod gif_decoder;
 mod img_source;
 mod scaler;
+mod video_decoder;
 mod wallpaper;
 
 /// Access glibc malloc tunables.
