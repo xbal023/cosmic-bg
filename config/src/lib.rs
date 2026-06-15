@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub const NAME: &str = "com.system76.CosmicBackground";
+pub const LOCKSCREEN_NAME: &str = "com.system76.CosmicBackground.LockScreen";
 pub const BACKGROUNDS: &str = "backgrounds";
 pub const DEFAULT_BACKGROUND: &str = "all";
 pub const SAME_ON_ALL: &str = "same-on-all";
@@ -21,6 +22,10 @@ pub const SAME_ON_ALL: &str = "same-on-all";
 /// Fails if cosmic-config paths are missing or cannot be created.
 pub fn context() -> Result<Context, cosmic_config::Error> {
     CosmicConfig::new(NAME, 1).map(Context)
+}
+
+pub fn lockscreen_context() -> Result<Context, cosmic_config::Error> {
+    CosmicConfig::new(LOCKSCREEN_NAME, 1).map(Context)
 }
 
 #[derive(Clone, Debug)]
