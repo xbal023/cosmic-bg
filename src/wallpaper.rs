@@ -153,6 +153,10 @@ impl Wallpaper {
                                 Some(crate::scaler::stretch(img, width, height))
                             }
                         };
+                    } else {
+                        // Background thread hasn't sent the first frame yet.
+                        // Skip rendering this cycle; the timer will trigger a redraw soon.
+                        continue;
                     }
                 } else {
                     // Static image / color fallback (original logic).

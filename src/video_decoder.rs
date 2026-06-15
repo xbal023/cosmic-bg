@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use ffmpeg_next as ffmpeg;
 
-/// Minimum frame delay (~30 FPS cap), matching the GIF decoder.
-const MIN_FRAME_DELAY: Duration = Duration::from_millis(33);
+/// Minimum frame delay (~60 FPS cap), matching the user request.
+const MIN_FRAME_DELAY: Duration = Duration::from_millis(16);
 
 /// Supported video file extensions.
 const VIDEO_EXTENSIONS: &[&str] = &[

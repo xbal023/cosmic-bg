@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Minimum delay between frames (~30 FPS cap).
-const MIN_FRAME_DELAY: Duration = Duration::from_millis(33);
+const MIN_FRAME_DELAY: Duration = Duration::from_millis(16);
 
 /// A collection of pre-decoded GIF frames with per-frame delays.
 #[derive(Debug)]
