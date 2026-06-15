@@ -210,7 +210,7 @@ impl Entry {
 }
 
 #[must_use]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub same_on_all: bool,
     pub outputs: HashSet<String>,
